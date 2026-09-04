@@ -30,6 +30,11 @@ for _k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID"):
     except Exception:
         pass        # no secrets.toml locally -- .env handles it
 
+# Streamlit Cloud sets HOSTNAME, and there is no .env there to point people at.
+_ON_CLOUD = bool(os.getenv("HOSTNAME", "").startswith("streamlit")
+                 or os.getenv("STREAMLIT_RUNTIME_ENV")
+                 or not (Path(__file__).resolve().parent / ".env").exists())
+
 import config as C
 from preprocess import run as run_preprocess
 from insights import build_all
@@ -114,8 +119,17 @@ with st.sidebar:
         st.success(agent.status)
     else:
         st.warning(agent.status)
-        st.caption("Add an API key to `.env` for written answers. "
-                   "All figures below are live either way.")
+        # The remedy differs by environment, and naming the wrong one sends
+        # people to a file that does not exist on the deployed app.
+        if _ON_CLOUD:
+            st.caption(
+                "Add it under **Manage app -> Settings -> Secrets** as "
+                "`GEMINI_API_KEY = \"...\"` (TOML, quotes required). "
+                "All figures below are live either way."
+            )
+        else:
+            st.caption("Add an API key to `.env` for written answers. "
+                       "All figures below are live either way.")
 
     st.divider()
     st.metric("Conversion", f"{insights['conversion']['overall']['conversion_pct']}%",
