@@ -1,0 +1,11 @@
+pandas>=2.0
+openpyxl>=3.1
+pyarrow>=14.0
+tabulate>=0.9
+streamlit>=1.30
+python-dotenv>=1.0
+
+# LLM providers. Only the one named in config.LLM_PROVIDER is used at runtime;
+# both are installed so switching is a one-line config change.
+google-genai>=1.0          # primary
+anthropic>=0.40            # kept for when the Anthropic account has credits
