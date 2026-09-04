@@ -1,13 +1,24 @@
 """
 make_samples.py
 ---------------
-Regenerates outputs/SAMPLE_INSIGHTS.md -- the "sample of the insights it
-produces" deliverable. Every figure in it is computed at run time; nothing is
-typed by hand.
+Regenerates SAMPLE_INSIGHTS.md -- the "sample of the insights it produces"
+deliverable.
+
+Two kinds of content, deliberately kept separate:
+
+  * What the AGENT SAYS  -- real LLM output, generated live at run time.
+  * What the AGENT KNOWS -- the deterministic tables behind every claim.
+
+Putting them in the same document is the point. A reader can take any number
+from the prose and find it in the tables below, which is the whole argument
+for computing metrics in pandas and letting the model only write sentences.
+
+Nothing in this file is hand-typed. Run it again and every figure updates.
 """
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -16,67 +27,110 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as C
 from insights import build_all
 from priority_flag import assign_priority, priority_summary
-from build_prompt import rupees
-from narrator import morning_brief, generate_findings, answer_offline
+from build_prompt import build_system_prompt, build_morning_brief_request, rupees
+from narrator import morning_brief, generate_findings
+from agent import BusinessInsightsAgent
 
 QUESTIONS = [
     "How has conversion changed over the last couple of months, and why?",
     "Which customers are new, growing, or slipping away?",
-    "Where is the business changing by category?",
-    "How is delivery performance across regions?",
-    "Who should my team call today?",
+    "Which product category is declining?",
+    "How is Gurgaon performing versus Noida?",
+    "Which customers should I call today?",
 ]
+
+# A follow-up chain, run in one conversation, to show that context carries.
+FOLLOW_UP = [
+    "What happened to Battery conversion?",
+    "Is that the same customers ordering, or new ones?",
+    "Put the Battery problem in one line I can forward to my ops head.",
+]
+
+
+def _fresh_agent(prompt, I, flags):
+    # Free-tier request-per-minute limits are easy to trip when generating a
+    # whole document in one go. Pace the calls rather than rely on retries.
+    time.sleep(C.SAMPLE_CALL_DELAY)
+    return BusinessInsightsAgent(prompt, insights=I, flags=flags)
 
 
 def main() -> Path:
     I = build_all()
     flags = assign_priority(I)
     psum = priority_summary(flags)
+    prompt = build_system_prompt(I, flags)
+
+    probe = _fresh_agent(prompt, I, flags)
+    live = probe.mode == "live"
+    engine = f"{probe.model} ({probe.provider})" if live else "deterministic narrator"
 
     L: list[str] = []
     add = L.append
 
     add("# Sample Insights\n")
-    add(f"Generated from `Raw_Data.xlsx` on data up to **{I['as_of']:%d %B %Y}** "
+    add(f"Generated from `Raw_Data.xlsx`, data to **{I['as_of']:%d %B %Y}** "
         f"({I['row_count']:,} enquiry lines, {len(flags)} customers).  ")
-    add("Every number below is computed by `insights.py`. Nothing here is "
-        "hand-written or model-generated.\n")
+    add(f"Answers written by **{engine}**. Every figure it quotes was computed "
+        "in `insights.py` and appears in the tables in section 5 - the model "
+        "does no arithmetic of its own.\n")
+    if not live:
+        add("> No API key was available when this was generated, so the "
+            "answers below come from the deterministic fallback rather than "
+            "an LLM.\n")
     add("---\n")
 
-    # 1 ---------------------------------------------------------------
-    add("## 1. The daily morning brief\n")
-    add("This is what lands in front of the BU head each morning.\n")
-    add(morning_brief(I, flags))
+    # 1 -----------------------------------------------------------------
+    add("## 1. The morning brief\n")
+    add("What lands in front of the BU head each morning.\n")
+    if live:
+        add(_fresh_agent(prompt, I, flags).brief(build_morning_brief_request(I)))
+    else:
+        add(morning_brief(I, flags))
     add("\n---\n")
 
-    # 2 ---------------------------------------------------------------
-    add("## 2. Answers to the questions in the brief\n")
+    # 2 -----------------------------------------------------------------
+    add("## 2. Questions a BU head actually asks\n")
+    add("Each answered in a fresh conversation, verbatim, no editing.\n")
     for q in QUESTIONS:
         add(f"### *\"{q}\"*\n")
-        a = answer_offline(q, I, flags)
-        add(a if a else "_No pre-computed finding matches this question._")
+        add(_fresh_agent(prompt, I, flags).ask(q))
         add("")
     add("---\n")
 
-    # 3 ---------------------------------------------------------------
-    add("## 3. Every finding the agent can surface, ranked by severity\n")
-    add("The agent leads with what matters rather than reciting metrics in "
-        "schema order.\n")
+    # 3 -----------------------------------------------------------------
+    add("## 3. A follow-up conversation\n")
+    add("One continuous chat, to show that context carries between turns - "
+        "the reason this is a conversation and not a dashboard.\n")
+    chat = _fresh_agent(prompt, I, flags)
+    for i, q in enumerate(FOLLOW_UP, 1):
+        add(f"**Q{i}. {q}**\n")
+        add(chat.ask(q))
+        add("")
+    if live:
+        add(f"*{chat.usage_summary()}*\n")
+    add("---\n")
+
+    # 4 -----------------------------------------------------------------
+    add("## 4. Everything the agent can surface, ranked\n")
+    add("Findings are scored so the brief leads with what matters rather than "
+        "reciting metrics in schema order.\n")
     for f in generate_findings(I, flags):
         add(f"- **[{f.severity:.0f}]** {f.headline} {f.detail}")
         if f.action:
             add(f"  - *Action:* {f.action}")
     add("\n---\n")
 
-    # 4 ---------------------------------------------------------------
-    add("## 4. Supporting tables\n")
+    # 5 -----------------------------------------------------------------
+    add("## 5. The numbers behind every answer\n")
+    add("The audit trail. Any figure quoted above can be checked here.\n")
+
     add("### Conversion by business unit\n")
     add(I["conversion"]["by_business_unit"].to_markdown(index=False))
 
     add("\n### Why conversion moved - last 30 days vs previous 30\n")
     add("Rate effect = the same segment converting differently. "
         "Mix effect = volume shifting between segments. "
-        "They sum exactly to the total change.\n")
+        "They sum exactly to the total change - no residual.\n")
     add(I["drivers_by_bu"].to_markdown(index=False))
     add("")
     add(I["drivers_by_category"].to_markdown(index=False))
@@ -96,12 +150,22 @@ def main() -> Path:
     tr["Revenue"] = tr["Revenue"].map(rupees)
     add(tr[["Week Of", "Enquiries", "Delivered", "Conversion %",
             "Revenue", "Complete"]].to_markdown(index=False))
-    add("\n`Complete = False` marks a week that is not yet fully observed. "
-        "The agent is instructed never to report it as a decline.\n")
+    add("\n`Complete = False` marks a week not yet fully observed. The agent "
+        "is instructed never to report it as a decline.\n")
 
-    add("### Customer lifecycle\n")
-    lc = pd.DataFrame(sorted(I["lifecycle_counts"].items(),
-                             key=lambda x: -x[1]),
+    add("### Where the lost enquiries go\n")
+    lb = I["conversion"]["loss_breakdown"]
+    add(pd.DataFrame([
+        {"Outcome": "Never quoted (no price ever given)",
+         "Lines": lb["never_quoted"], "% of enquiries": lb["never_quoted_pct_of_all"]},
+        {"Outcome": "Quoted but lost",
+         "Lines": lb["quoted_but_lost"], "% of enquiries": lb["quoted_but_lost_pct_of_all"]},
+        {"Outcome": "Returned", "Lines": lb["returned"], "% of enquiries": None},
+        {"Outcome": "Still in progress", "Lines": lb["in_progress"], "% of enquiries": None},
+    ]).to_markdown(index=False))
+
+    add("\n### Customer lifecycle\n")
+    lc = pd.DataFrame(sorted(I["lifecycle_counts"].items(), key=lambda x: -x[1]),
                       columns=["Lifecycle", "Customers"])
     add(lc.to_markdown(index=False))
 
@@ -109,8 +173,8 @@ def main() -> Path:
     add(I["channel_split"].to_markdown(index=False))
     add("\n---\n")
 
-    # 5 ---------------------------------------------------------------
-    add("## 5. Sales Priority Flag - example output\n")
+    # 6 -----------------------------------------------------------------
+    add("## 6. Sales Priority Flag\n")
     add(f"**P1** {psum['counts']['P1']} customers "
         f"({rupees(psum['revenue_at_stake']['P1'])}, "
         f"{psum['p1_revenue_share_pct']}% of delivered revenue) &nbsp;|&nbsp; "
@@ -169,7 +233,7 @@ def main() -> Path:
     add("\n### P2 sample (top 10 by urgency)\n")
     p2 = flags[flags["Priority"] == "P2"].head(10).copy()
     p2["Total Revenue"] = p2["Total Revenue"].map(rupees)
-    add(p2[["Customer Name", "Business Unit", "Total Revenue",
+    add(p2[["Customer Name", "Business Unit", "Issue Owner", "Total Revenue",
             "Days Since Last Order", "Consecutive NDs", "Reason"]]
         .rename(columns={"Total Revenue": "Revenue",
                          "Days Since Last Order": "Days Quiet",

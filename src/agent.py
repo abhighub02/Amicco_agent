@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -256,6 +257,22 @@ class BusinessInsightsAgent:
         self.history.append({"role": "assistant", "content": answer})
         return answer
 
+    @staticmethod
+    def _daily_quota(err: Exception) -> bool:
+        """A per-day quota does not clear by waiting -- switch model instead."""
+        return "PerDay" in str(err) or "RequestsPerDay" in str(err)
+
+    @staticmethod
+    def _retryable(err: Exception) -> bool:
+        """5xx and rate limits are transient; 4xx are not worth retrying."""
+        m = str(err)
+        # 429 is included: on a free tier it means "too fast", not "too much",
+        # and backing off for a second usually clears it.
+        return (type(err).__name__ in ("ServerError", "ClientError")
+                and any(c in m for c in ("429", "500", "502", "503", "504",
+                                         "529", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+                or type(err).__name__ == "ServerError")
+
     def _live_gemini(self, question: str) -> str:
         """
         Gemini path. Same contract as the Claude path: the briefing goes in
@@ -268,24 +285,56 @@ class BusinessInsightsAgent:
         explicit cache handle. There is no equivalent of Anthropic's
         cache_control to set here.
         """
-        try:
-            contents = [
-                genai_types.Content(
-                    role=("model" if m["role"] == "assistant" else "user"),
-                    parts=[genai_types.Part(text=m["content"])],
-                )
-                for m in self.history
-            ]
-            resp = self.client.models.generate_content(
-                model=self.model,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=self.system_prompt,
-                    max_output_tokens=C.MAX_TOKENS,
-                ),
-                contents=contents,
+        contents = [
+            genai_types.Content(
+                role=("model" if m["role"] == "assistant" else "user"),
+                parts=[genai_types.Part(text=m["content"])],
             )
+            for m in self.history
+        ]
+        try:
+            # Transient 5xx from the model host is common enough that one
+            # retry turns a visible failure into a slightly slower answer.
+            resp = None
+            models = [self.model] + [m for m in C.GEMINI_FALLBACK_MODELS
+                                     if m != self.model]
+            last_err = None
+            for model_name in models:
+                for attempt in range(C.LLM_RETRIES + 1):
+                    try:
+                        resp = self.client.models.generate_content(
+                            model=model_name,
+                            config=genai_types.GenerateContentConfig(
+                                system_instruction=self.system_prompt,
+                                max_output_tokens=C.GEMINI_MAX_OUTPUT,
+                            ),
+                            contents=contents,
+                        )
+                        self.active_model = model_name
+                        break
+                    except Exception as err:
+                        last_err = err
+                        # A per-day quota will not clear by waiting, so move
+                        # straight to the next model rather than sleeping.
+                        if self._daily_quota(err):
+                            break
+                        if attempt >= C.LLM_RETRIES or not self._retryable(err):
+                            break
+                        wait = C.LLM_RETRY_BACKOFF * (2 ** attempt)
+                        if "429" in str(err):
+                            wait = max(wait, C.LLM_RATELIMIT_BACKOFF * (attempt + 1))
+                        time.sleep(wait)
+                if resp is not None:
+                    break
+            if resp is None:
+                raise last_err
             self._record_usage_gemini(resp)
+            fr = str(getattr(resp.candidates[0], "finish_reason", "")) if resp.candidates else ""
             text = (resp.text or "").strip()
+            if "MAX_TOKENS" in fr and len(text) < 40:
+                return ("The answer was cut off before it started - the model "
+                        "spent its whole budget on reasoning. Raise "
+                        "GEMINI_MAX_OUTPUT in config.py.")
             if not text:
                 return ("The model returned an empty response. Here are the "
                         "figures instead.\n\n" + self._offline.answer(question))
@@ -395,7 +444,7 @@ class BusinessInsightsAgent:
                     model=self.model,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=self.system_prompt,
-                        max_output_tokens=1500),
+                        max_output_tokens=C.GEMINI_MAX_OUTPUT),
                     contents=request)
                 self._record_usage_gemini(resp)
                 return (resp.text or "").strip()

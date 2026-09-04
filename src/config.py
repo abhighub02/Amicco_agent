@@ -89,10 +89,32 @@ PRICE_PER_MTOK_OUT = 15.00
 #   "anthropic" -> Claude
 LLM_PROVIDER = "gemini"
 
-# gemini-1.5-flash and gemini-2.5-flash are both retired for new users; 3.6 is
-# the current Flash generation. Verified against models.list on this key.
-GEMINI_MODEL = "gemini-3.6-flash"
+# gemini-1.5-flash and gemini-2.5-flash are both retired for new users.
+# Verified against models.list on this key.
+#
+# IMPORTANT for a free-tier demo: the Gemini free tier caps requests PER DAY
+# PER MODEL (gemini-3.6-flash allows only 20/day). Flash-Lite has its own,
+# larger allowance, so it is the default and 3.6-flash is the overflow. The
+# agent walks this list on a quota error, which keeps a live demo alive after
+# the first model is exhausted.
+GEMINI_MODEL = "gemini-flash-lite-latest"
+GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-flash-latest"]
 
 # Gemini Flash pricing, USD per million tokens (free tier available).
 GEMINI_PRICE_IN = 0.075
 GEMINI_PRICE_OUT = 0.30
+
+# Gemini 3.x spends THINKING tokens out of the same max_output_tokens budget,
+# and thinking cannot be disabled on Flash. A 1,500 ceiling produced a brief
+# that was 1,436 tokens of reasoning and 60 tokens of answer -- it hit
+# MAX_TOKENS and came back blank. The ceiling must leave room for both.
+# Observed: ~2,000 thinking + ~250 answer on a short brief.
+GEMINI_MAX_OUTPUT = 8000
+
+# Transient 5xx from a model host is common. One retry converts a visible
+# failure into a slightly slower answer; more than two just delays the
+# fallback the user would rather see.
+LLM_RETRIES = 2
+LLM_RETRY_BACKOFF = 1.5   # seconds, doubled each attempt
+LLM_RATELIMIT_BACKOFF = 8.0   # seconds; free-tier RPM windows are ~1 minute
+SAMPLE_CALL_DELAY = 3.0       # pacing between calls when generating samples
